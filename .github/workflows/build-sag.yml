@@ -1,0 +1,132 @@
+name: build-sag
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "SAG-Wiki tag to build (empty = latest upstream release)"
+        required: false
+        default: ""
+      force:
+        description: "Rebuild even if a release for this tag already exists"
+        type: boolean
+        required: false
+        default: true
+  schedule:
+    - cron: "0 21 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.r.outputs.tag }}
+      need: ${{ steps.r.outputs.need }}
+    steps:
+      - id: r
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            TAG=$(curl -fsSL https://api.github.com/repos/Zleap-AI/SAG-Wiki/releases/latest | jq -r .tag_name)
+          fi
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            echo "::error::could not resolve upstream tag"
+            exit 1
+          fi
+          echo "resolved tag: $TAG"
+          if [ "${{ inputs.force }}" = "true" ]; then
+            NEED=yes
+          elif gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            NEED=no
+          else
+            NEED=yes
+          fi
+          echo "need=$NEED" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.need == 'yes'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            flavor: macos-x86_64
+          - os: ubuntu-latest
+            flavor: linux-x86_64
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_TERM_COLOR: always
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - name: Clone upstream at tag
+        run: git clone --depth 1 --branch "${{ needs.resolve.outputs.tag }}" https://github.com/Zleap-AI/SAG-Wiki.git src
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src/cli -> target"
+          key: ${{ matrix.flavor }}
+
+      - name: Build sag CLI
+        run: cargo build --release --locked --manifest-path src/cli/Cargo.toml --bin sag
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.resolve.outputs.tag }}"
+          BIN="src/cli/target/release/sag"
+          test -x "$BIN" || { echo "::error::binary not produced"; exit 1; }
+          "$BIN" --version || true
+          OUT="sag-${TAG}-${{ matrix.flavor }}.tar.gz"
+          tar -czf "$OUT" -C "$(dirname "$BIN")" sag
+          ls -lh "$OUT"
+          shasum -a 256 "$OUT" > "$OUT.sha256" 2>/dev/null || sha256sum "$OUT" > "$OUT.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sag-${{ matrix.flavor }}
+          path: |
+            sag-*.tar.gz
+            sag-*.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    needs: [resolve, build]
+    if: needs.resolve.outputs.need == 'yes'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List files
+        run: ls -lh dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.resolve.outputs.tag }}
+          name: "SAG-Wiki ${{ needs.resolve.outputs.tag }} (self-built x86_64)"
+          files: |
+            dist/sag-*.tar.gz
+            dist/sag-*.tar.gz.sha256
+          body: |
+            Self-built x86_64 binaries for `sag` CLI, from upstream tag `${{ needs.resolve.outputs.tag }}`.
+
+            Upstream: https://github.com/Zleap-AI/SAG-Wiki
+
+            Install:
+            ```
+            tar -xzf sag-${{ needs.resolve.outputs.tag }}-macos-x86_64.tar.gz
+            xattr -d com.apple.quarantine ./sag
+            mv sag ~/.local/bin/sag
+            sag --version
+            ```
